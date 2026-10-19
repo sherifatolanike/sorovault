@@ -94,9 +94,44 @@ func (f *fixture) refresher(t *testing.T) *refresher.Refresher {
 		Interval: interval,
 		Logger:   f.log,
 		Now:      f.clock.Now,
+		Wait: func(ctx context.Context, d time.Duration) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			f.clock.Advance(d)
+			return nil
+		},
 	})
 	require.NoError(t, err)
 	return r
+}
+
+func TestSweepSpreadsRefreshesAcrossInterval(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	for i := 0; i < 4; i++ {
+		f.register(t, contractID(t, i), "hello")
+	}
+	f.clock.Advance(interval + time.Minute)
+
+	var waits []time.Duration
+	r, err := refresher.New(f.reg, refresher.Options{
+		Interval: interval,
+		Logger:   f.log,
+		Now:      f.clock.Now,
+		Wait: func(ctx context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			f.clock.Advance(d)
+			return ctx.Err()
+		},
+	})
+	require.NoError(t, err)
+
+	sum, err := r.Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 4, sum.Checked)
+	assert.Equal(t, []time.Duration{interval / 4, interval / 4, interval / 4}, waits,
+		"refreshes after the first must start at evenly spaced offsets")
 }
 
 func (f *fixture) register(t *testing.T, id, fn string) {
@@ -216,6 +251,67 @@ func TestSweepFailsWhenNetworkUnresolvable(t *testing.T) {
 
 	_, err := f.refresher(t).Sweep(context.Background())
 	assert.ErrorContains(t, err, "rpc down")
+}
+
+// TestSweepDefersWhenTheRegistryIsBusy proves a busy registry defers a
+// refresh rather than failing it: the contract stays stale, so the next
+// sweep picks it up.
+func TestSweepDefersWhenTheRegistryIsBusy(t *testing.T) {
+	t.Parallel()
+
+	c := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	db := store.NewMemory()
+	db.SetClock(c.Now)
+	fake := stellartest.New()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := registry.New(fake, spec.XDRDecoder{}, db, registry.Options{
+		Logger:         log,
+		MaxConcurrent:  1,
+		AcquireTimeout: 50 * time.Millisecond,
+	})
+
+	id := contractID(t, 1)
+	fake.Deploy(id, moduleWith(t, "hello"))
+	_, err := reg.Register(context.Background(), id)
+	require.NoError(t, err)
+
+	// Hold the only slot with a registration that does not finish.
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	fake.BeforeFetch = func(ctx context.Context, contractID string) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	held := make(chan struct{})
+	go func() {
+		defer close(held)
+		_, _ = reg.Register(context.Background(), id)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the registration to start")
+	}
+
+	c.Advance(interval + time.Minute)
+	r, err := refresher.New(reg, refresher.Options{Interval: interval, Logger: log, Now: c.Now})
+	require.NoError(t, err)
+
+	sum, err := r.Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, refresher.Summary{Checked: 1, Busy: 1}, sum,
+		"a busy registry defers the refresh rather than failing it")
+
+	close(release)
+	<-held
 }
 
 func TestRunStopsOnCancel(t *testing.T) {

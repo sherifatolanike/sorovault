@@ -10,10 +10,13 @@ package registry
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/soroworks/sorovault/internal/model"
 	"github.com/soroworks/sorovault/internal/spec"
@@ -26,6 +29,9 @@ import (
 // wrong namespace, so registration stops instead.
 var ErrNetworkMismatch = errors.New("registry: RPC endpoint serves a different network than configured")
 
+// ErrInvalidWasmHash reports a hash that is not a 32-byte hexadecimal value.
+var ErrInvalidWasmHash = errors.New("registry: invalid wasm hash")
+
 // Registry registers and refreshes contracts.
 type Registry struct {
 	fetcher stellar.Fetcher
@@ -35,6 +41,15 @@ type Registry struct {
 
 	// expectPassphrase, when set, must match what the endpoint reports.
 	expectPassphrase string
+
+	// sem bounds how many registrations and refreshes run at once, and
+	// acquireTimeout bounds how long one waits for a slot. The budget is
+	// shared by everything that registers — API clients, the CLI and the
+	// refresher alike — because they all draw on the same memory and the
+	// same network.
+	sem            *semaphore.Weighted
+	acquireTimeout time.Duration
+	maxConcurrent  int
 
 	// The network label is resolved from the endpoint on first use and
 	// cached; it does not change for the life of the process. A mismatch is
@@ -53,6 +68,13 @@ type Options struct {
 	ExpectPassphrase string
 	// Logger receives operational detail. Defaults to slog.Default.
 	Logger *slog.Logger
+	// MaxConcurrent bounds how many registrations and refreshes run at
+	// once. Values below one mean DefaultMaxConcurrent.
+	MaxConcurrent int
+	// AcquireTimeout bounds how long an operation waits for a slot before
+	// it is refused with ErrBusy. Values below one mean
+	// DefaultAcquireTimeout.
+	AcquireTimeout time.Duration
 }
 
 // New builds a Registry from its three collaborators.
@@ -61,14 +83,32 @@ func New(f stellar.Fetcher, d spec.Decoder, s store.Store, opts Options) *Regist
 	if log == nil {
 		log = slog.Default()
 	}
+	maxConcurrent := opts.MaxConcurrent
+	if maxConcurrent < 1 {
+		maxConcurrent = DefaultMaxConcurrent
+	}
+	acquireTimeout := opts.AcquireTimeout
+	if acquireTimeout <= 0 {
+		acquireTimeout = DefaultAcquireTimeout
+	}
 	return &Registry{
 		fetcher:          f,
 		decoder:          d,
 		store:            s,
 		log:              log,
 		expectPassphrase: opts.ExpectPassphrase,
+		sem:              semaphore.NewWeighted(int64(maxConcurrent)),
+		acquireTimeout:   acquireTimeout,
+		maxConcurrent:    maxConcurrent,
 	}
 }
+
+// MaxConcurrent reports how many registrations and refreshes may run at once.
+func (r *Registry) MaxConcurrent() int { return r.maxConcurrent }
+
+// AcquireTimeout reports how long an operation waits for a slot before it
+// is refused with ErrBusy.
+func (r *Registry) AcquireTimeout() time.Duration { return r.acquireTimeout }
 
 // Result describes what a register or refresh call did.
 type Result struct {
@@ -81,6 +121,15 @@ type Result struct {
 	// Changed is true when the contract's WASM hash differed from what was
 	// stored, so a new interface version was recorded.
 	Changed bool `json:"changed"`
+}
+
+// WasmResult describes a catalogued upload that may not be deployed yet.
+type WasmResult struct {
+	Network   string           `json:"network"`
+	WasmHash  string           `json:"wasm_hash"`
+	Interface *model.Interface `json:"interface"`
+	DecodedAt time.Time        `json:"decoded_at"`
+	Created   bool             `json:"created"`
 }
 
 // Network returns the label records are stored under, resolved from the RPC
@@ -103,14 +152,53 @@ func (r *Registry) Network(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	if r.expectPassphrase != "" && passphrase != r.expectPassphrase {
-		r.networkMismatch = fmt.Errorf("%w: endpoint reports %q, configured %q",
-			ErrNetworkMismatch, passphrase, r.expectPassphrase)
+	if err := CheckPassphrase(passphrase, r.expectPassphrase); err != nil {
+		r.networkMismatch = err
 		return "", r.networkMismatch
 	}
 
 	r.network = stellar.NetworkName(passphrase)
 	return r.network, nil
+}
+
+// CheckPassphrase reports whether the passphrase an endpoint reports is the
+// one the operator expects.
+//
+// An empty expectation accepts whatever the endpoint says: not every
+// deployment knows the passphrase it is talking to, and refusing to work
+// because of that would be worse than the risk.
+func CheckPassphrase(got, want string) error {
+	if want == "" || got == want {
+		return nil
+	}
+	return fmt.Errorf("%w: endpoint reports %q, configured %q",
+		ErrNetworkMismatch, got, want)
+}
+
+// acquire takes a slot in the concurrency budget, waiting at most for the
+// configured window.
+//
+// A deadline that expires is the registry's, not the caller's: the caller
+// still wants the work done and the registry is simply too busy, which is
+// ErrBusy. A cancelled caller context is the caller's own, and is returned
+// as it is.
+func (r *Registry) acquire(ctx context.Context) error {
+	waitCtx, cancel := context.WithTimeout(ctx, r.acquireTimeout)
+	defer cancel()
+
+	if err := r.sem.Acquire(waitCtx, 1); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return fmt.Errorf("%w: %d already running", ErrBusy, r.maxConcurrent)
+		}
+		return err
+	}
+	return nil
+}
+
+// release gives a slot back. It is called once per successful acquire, on
+// every path out of an operation: success, failure and cancellation alike.
+func (r *Registry) release() {
+	r.sem.Release(1)
 }
 
 // Register fetches, decodes and stores a contract's interface.
@@ -122,6 +210,13 @@ func (r *Registry) Register(ctx context.Context, contractID string) (*Result, er
 	if err := stellar.ValidateContractID(contractID); err != nil {
 		return nil, err
 	}
+
+	// The budget is taken before anything expensive happens, and given back
+	// on every path out of here.
+	if err := r.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer r.release()
 
 	network, err := r.Network(ctx)
 	if err != nil {
@@ -178,6 +273,54 @@ func (r *Registry) Register(ctx context.Context, contractID string) (*Result, er
 	return result, nil
 }
 
+// CatalogWasm decodes code uploaded to the network without requiring a
+// contract instance to reference it.
+func (r *Registry) CatalogWasm(ctx context.Context, wasmHash string) (*WasmResult, error) {
+	rawHash, err := hex.DecodeString(wasmHash)
+	if err != nil || len(rawHash) != sha256.Size {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidWasmHash, wasmHash)
+	}
+	wasmHash = hex.EncodeToString(rawHash)
+
+	network, err := r.Network(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if existing, err := r.store.GetWasmSpec(ctx, network, wasmHash); err == nil {
+		return &WasmResult{
+			Network: existing.Network, WasmHash: existing.WasmHash,
+			Interface: existing.Interface, DecodedAt: existing.DecodedAt,
+		}, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+
+	wasm, err := r.fetcher.FetchWasm(ctx, wasmHash)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(wasm)
+	if hex.EncodeToString(digest[:]) != wasmHash {
+		return nil, fmt.Errorf("registry: fetched wasm does not match hash %s", wasmHash)
+	}
+
+	iface, err := r.decoder.Decode(wasm)
+	if err != nil {
+		return nil, fmt.Errorf("registry: decoding wasm %s: %w", wasmHash, err)
+	}
+	if err := r.store.SaveWasmSpec(ctx, network, wasmHash, iface); err != nil {
+		return nil, err
+	}
+	stored, err := r.store.GetWasmSpec(ctx, network, wasmHash)
+	if err != nil {
+		return nil, err
+	}
+	return &WasmResult{
+		Network: stored.Network, WasmHash: stored.WasmHash,
+		Interface: stored.Interface, DecodedAt: stored.DecodedAt, Created: true,
+	}, nil
+}
+
 // Refresh re-checks a registered contract against the network and records a
 // new interface version if its WASM has changed.
 //
@@ -188,6 +331,14 @@ func (r *Registry) Refresh(ctx context.Context, contractID string) (*Result, err
 	if err := stellar.ValidateContractID(contractID); err != nil {
 		return nil, err
 	}
+
+	// Refreshes draw on the same budget as registrations: both download and
+	// decode modules, and the refresher's own sweep is no more entitled to
+	// the memory than a client asking over HTTP.
+	if err := r.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer r.release()
 
 	network, err := r.Network(ctx)
 	if err != nil {

@@ -9,6 +9,7 @@ package refresher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -39,6 +40,9 @@ type Options struct {
 	Logger *slog.Logger
 	// Now is the clock; tests replace it. Defaults to time.Now.
 	Now func() time.Time
+	// Wait pauses between scheduled refreshes. Tests replace it to avoid
+	// sleeping; the default respects context cancellation.
+	Wait func(context.Context, time.Duration) error
 }
 
 // Refresher runs periodic sweeps over the registry.
@@ -48,6 +52,7 @@ type Refresher struct {
 	timeout  time.Duration
 	log      *slog.Logger
 	now      func() time.Time
+	wait     func(context.Context, time.Duration) error
 }
 
 // New builds a Refresher. It returns an error for a non-positive interval
@@ -64,12 +69,17 @@ func New(reg Registry, opts Options) (*Refresher, error) {
 	if now == nil {
 		now = time.Now
 	}
+	wait := opts.Wait
+	if wait == nil {
+		wait = waitContext
+	}
 	return &Refresher{
 		reg:      reg,
 		interval: opts.Interval,
 		timeout:  opts.Timeout,
 		log:      log,
 		now:      now,
+		wait:     wait,
 	}, nil
 }
 
@@ -81,6 +91,9 @@ type Summary struct {
 	Changed int `json:"changed"`
 	// Failed is how many could not be refreshed. Their errors are logged.
 	Failed int `json:"failed"`
+	// Busy is how many were not attempted because the registry was at its
+	// concurrency limit. They stay stale, so the next sweep picks them up.
+	Busy int `json:"busy"`
 }
 
 // Run sweeps once immediately and then every interval until ctx is
@@ -140,15 +153,46 @@ func (r *Refresher) Sweep(ctx context.Context) (Summary, error) {
 	if err != nil {
 		return sum, err
 	}
+	if len(stale) == 0 {
+		return sum, nil
+	}
 
-	for _, id := range stale {
+	started := r.now()
+	count := int64(len(stale))
+	step := r.interval / time.Duration(count)
+	remainder := int64(r.interval % time.Duration(count))
+	var target time.Duration
+	var remainderProgress int64
+	for i, id := range stale {
 		if ctx.Err() != nil {
 			return sum, ctx.Err()
+		}
+		if i > 0 {
+			target += step
+			remainderProgress += remainder
+			if remainderProgress >= count {
+				target++
+				remainderProgress -= count
+			}
+			if delay := target - r.now().Sub(started); delay > 0 {
+				if err := r.wait(ctx, delay); err != nil {
+					return sum, err
+				}
+			}
 		}
 
 		sum.Checked++
 		result, err := r.refreshOne(ctx, id)
 		if err != nil {
+			// A busy registry is not a failure: the contract stays stale
+			// and the next sweep tries again. Failing it would report a
+			// problem where there is none.
+			if errors.Is(err, registry.ErrBusy) {
+				sum.Busy++
+				r.log.DebugContext(ctx, "refresh deferred, registry busy",
+					"contract_id", id, "network", network)
+				continue
+			}
 			sum.Failed++
 			r.log.WarnContext(ctx, "refresh failed",
 				"contract_id", id, "network", network, "error", err)
@@ -160,6 +204,17 @@ func (r *Refresher) Sweep(ctx context.Context) (Summary, error) {
 	}
 
 	return sum, nil
+}
+
+func waitContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (r *Refresher) refreshOne(ctx context.Context, id string) (*registry.Result, error) {

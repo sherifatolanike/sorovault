@@ -25,6 +25,7 @@ type Fake struct {
 	mu sync.Mutex
 
 	contracts map[string][]byte
+	wasm      map[string][]byte
 
 	// Passphrase is what Network reports. It defaults to testnet.
 	Passphrase string
@@ -35,6 +36,12 @@ type Fake struct {
 	HashErr  error
 	// NetworkErr, when set, is returned by Network.
 	NetworkErr error
+
+	// BeforeFetch, when set, runs before every fetch and hash lookup, and
+	// may block. Holding a fetch open is how a test proves a concurrency
+	// bound: the calls that got a slot are inside it, and the ones that did
+	// not never reach it.
+	BeforeFetch func(ctx context.Context, contractID string) error
 
 	// Calls counts invocations by method name, so a test can assert that
 	// refreshing an unchanged contract did not download its module.
@@ -47,9 +54,19 @@ var _ stellar.Fetcher = (*Fake)(nil)
 func New() *Fake {
 	return &Fake{
 		contracts:  map[string][]byte{},
+		wasm:       map[string][]byte{},
 		Passphrase: stellar.NetworkTestnet,
 		Calls:      map[string]int{},
 	}
+}
+
+// UploadWasm makes code available by hash without creating a contract instance.
+func (f *Fake) UploadWasm(wasmModule []byte) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hash := HashOf(wasmModule)
+	f.wasm[hash] = append([]byte(nil), wasmModule...)
+	return hash
 }
 
 // Deploy makes contractID resolve to the given module.
@@ -81,6 +98,11 @@ func (f *Fake) FetchContract(ctx context.Context, contractID string) (*stellar.C
 	if err := stellar.ValidateContractID(contractID); err != nil {
 		return nil, err
 	}
+	// The hook runs before the lock is taken, so a test can hold a fetch
+	// open without freezing the whole fake.
+	if err := f.beforeFetch(ctx, contractID); err != nil {
+		return nil, err
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -102,12 +124,39 @@ func (f *Fake) FetchContract(ctx context.Context, contractID string) (*stellar.C
 	}, nil
 }
 
+// FetchWasm implements stellar.Fetcher.
+func (f *Fake) FetchWasm(ctx context.Context, wasmHash string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls["FetchWasm"]++
+	module, ok := f.wasm[wasmHash]
+	if !ok {
+		for _, deployed := range f.contracts {
+			if HashOf(deployed) == wasmHash {
+				module = deployed
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", stellar.ErrWasmNotFound, wasmHash)
+	}
+	return append([]byte(nil), module...), nil
+}
+
 // WasmHash implements stellar.Fetcher.
 func (f *Fake) WasmHash(ctx context.Context, contractID string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	if err := stellar.ValidateContractID(contractID); err != nil {
+		return "", err
+	}
+	if err := f.beforeFetch(ctx, contractID); err != nil {
 		return "", err
 	}
 
@@ -124,6 +173,18 @@ func (f *Fake) WasmHash(ctx context.Context, contractID string) (string, error) 
 		return "", fmt.Errorf("%w: %s", stellar.ErrContractNotFound, contractID)
 	}
 	return HashOf(module), nil
+}
+
+// beforeFetch runs the BeforeFetch hook, if the test set one.
+func (f *Fake) beforeFetch(ctx context.Context, contractID string) error {
+	f.mu.Lock()
+	hook := f.BeforeFetch
+	f.mu.Unlock()
+
+	if hook == nil {
+		return nil
+	}
+	return hook(ctx, contractID)
 }
 
 // Network implements stellar.Fetcher.

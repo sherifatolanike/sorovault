@@ -73,6 +73,18 @@ type Config struct {
 // and a public RPC endpoint would see it as abuse.
 const MinRefreshInterval = time.Minute
 
+// Bounds on MAX_CONCURRENT_REGISTRATIONS, the number of registrations and
+// refreshes allowed to run at once.
+const (
+	// MinConcurrentRegistrationLimit is the smallest limit accepted: one
+	// registration at a time is a limit, none at all is not.
+	MinConcurrentRegistrationLimit = 1
+	// MaxConcurrentRegistrationLimit is the largest limit accepted. Every
+	// registration holds a WASM module in memory while it decodes, so a
+	// limit in the thousands would defeat the point of having one.
+	MaxConcurrentRegistrationLimit = 1000
+)
+
 // Load reads configuration from the process environment.
 //
 // The database connection string is the only setting with no usable default
