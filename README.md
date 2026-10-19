@@ -180,7 +180,7 @@ $ curl -si -X POST localhost:8080/api/contracts \
 HTTP/1.1 503 Service Unavailable
 Retry-After: 2
 …
-{"error":"registry: too many registrations in flight: 4 already in flight"}
+{"error":"registry: too many registrations in flight: 4 already running"}
 ```
 
 The wait is short on purpose: a client that is told to come back shortly is
@@ -233,6 +233,7 @@ sorovault get <contract_id>         # --function, --wasm-hash, --json
 sorovault codegen <contract_id>     # typed TypeScript client; -o, --wasm-hash
 sorovault serve                     # JSON API + browse UI
 sorovault migrate                   # apply schema migrations
+sorovault doctor                    # check a deployment's health
 ```
 
 `add` and `refresh` accept several contract IDs and report per-contract
@@ -248,6 +249,44 @@ inputs:
 
 returns: bool
 ```
+
+### `sorovault doctor`
+
+When a deployment misbehaves, the same four questions come up: can it reach
+Postgres, are the migrations up to date, does the RPC endpoint answer, and
+is it serving the network this instance expects. `doctor` answers all four in
+one go:
+
+```console
+$ sorovault doctor
+PASS  database    the database answers
+PASS  migrations  the database is at version 2, the latest is 2
+PASS  rpc         the endpoint is reachable, serving testnet
+PASS  passphrase  the endpoint serves the configured network
+```
+
+Every check runs, so one failure does not hide the others, and the command
+exits non-zero if any of them failed. `--json` emits the same report for a
+script to read:
+
+```console
+$ sorovault doctor --json
+{
+  "ok": false,
+  "checks": [
+    { "name": "database", "ok": true, "detail": "the database answers" },
+    { "name": "migrations", "ok": false, "error": "the database is at version 1, but version 2 is available; run `sorovault migrate`" },
+    { "name": "rpc", "ok": true, "detail": "the endpoint is reachable, serving testnet" },
+    { "name": "passphrase", "ok": true, "detail": "the endpoint serves the configured network" }
+  ]
+}
+```
+
+The command is strictly read-only: it opens a connection and reads, and
+never writes to the database, applies a migration, or changes anything on
+the network. It reads the same configuration as everything else, so a
+deployment missing its `DATABASE_URL` is reported as a configuration error
+rather than a passing check.
 
 ## Typed clients
 

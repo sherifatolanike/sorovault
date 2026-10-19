@@ -58,6 +58,7 @@ Configuration is read from the environment:
 		newRefreshCmd(),
 		newServeCmd(),
 		newMigrateCmd(),
+		newDoctorCmd(doctorDepsFromEnv),
 	)
 
 	return root
