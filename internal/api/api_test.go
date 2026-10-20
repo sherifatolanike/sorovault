@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -40,7 +41,15 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	return newHarnessWith(t, registry.Options{})
+	return newHarnessWithStore(t, stellartest.New(), store.NewMemory())
+}
+
+// newHarnessWithStore is newHarness with a store of the caller's choosing,
+// so a test can watch what the API does with one.
+func newHarnessWithStore(t *testing.T, fake *stellartest.Fake, db store.Store) *harness {
+	t.Helper()
+
+	return newHarnessWithOptions(t, fake, db, registry.Options{})
 }
 
 // newHarnessWith is newHarness with the registry's own options, so a test
@@ -48,8 +57,14 @@ func newHarness(t *testing.T) *harness {
 func newHarnessWith(t *testing.T, opts registry.Options) *harness {
 	t.Helper()
 
-	fake := stellartest.New()
-	db := store.NewMemory()
+	return newHarnessWithOptions(t, stellartest.New(), store.NewMemory(), opts)
+}
+
+// newHarnessWithOptions builds a harness over the given network, store and
+// registry options.
+func newHarnessWithOptions(t *testing.T, fake *stellartest.Fake, db store.Store, opts registry.Options) *harness {
+	t.Helper()
+
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if opts.Logger == nil {
 		opts.Logger = log
@@ -64,6 +79,25 @@ func newHarnessWith(t *testing.T, opts registry.Options) *harness {
 	t.Cleanup(srv.Close)
 
 	return &harness{server: srv, fake: fake, store: db}
+}
+
+type countingStore struct {
+	store.Store
+	mu        sync.Mutex
+	specReads int
+}
+
+func (s *countingStore) GetSpec(ctx context.Context, network, contractID, wasmHash string) (*store.Spec, error) {
+	s.mu.Lock()
+	s.specReads++
+	s.mu.Unlock()
+	return s.Store.GetSpec(ctx, network, contractID, wasmHash)
+}
+
+func (s *countingStore) reads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.specReads
 }
 
 func (h *harness) do(t *testing.T, method, path, body string) (*http.Response, []byte) {
@@ -97,7 +131,7 @@ func (h *harness) decode(t *testing.T, raw []byte) map[string]any {
 	return out
 }
 
-func moduleWith(t *testing.T, fnName string) []byte {
+func moduleWith(t testing.TB, fnName string) []byte {
 	t.Helper()
 
 	entry := xdr.ScSpecEntry{
@@ -319,6 +353,38 @@ func TestGetContract(t *testing.T) {
 	assert.Equal(t, "u32", fn["outputs"].([]any)[0].(map[string]any)["display"])
 }
 
+func TestGetContractCachesInterfaceAndTracksUpgrades(t *testing.T) {
+	t.Parallel()
+
+	fake := stellartest.New()
+	db := &countingStore{Store: store.NewMemory()}
+	h := newHarnessWithStore(t, fake, db)
+	fake.Deploy(idA, moduleWith(t, "v1"))
+
+	resp, raw := h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idA+`"}`)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
+
+	for range 2 {
+		resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA, "")
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+		functions := h.decode(t, raw)["interface"].(map[string]any)["functions"].([]any)
+		assert.Equal(t, "v1", functions[0].(map[string]any)["name"])
+	}
+	assert.Equal(t, 1, db.reads(), "a cache hit must skip loading and decoding the stored spec")
+
+	fake.Upgrade(idA, moduleWith(t, "v2"))
+	resp, raw = h.do(t, http.MethodPost, "/api/contracts/"+idA+"/refresh", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA, "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	got := h.decode(t, raw)
+	functions := got["interface"].(map[string]any)["functions"].([]any)
+	assert.Equal(t, "v2", functions[0].(map[string]any)["name"])
+	assert.True(t, got["current"].(bool))
+	assert.Equal(t, 2, db.reads(), "a new WASM hash must load its own interface")
+}
+
 func TestGetContractNotFound(t *testing.T) {
 	t.Parallel()
 
@@ -354,6 +420,55 @@ func TestGetFunction(t *testing.T) {
 	t.Run("missing contract", func(t *testing.T) {
 		resp, _ := h.do(t, http.MethodGet, "/api/contracts/"+idB+"/functions/balance", "")
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	})
+}
+
+func TestListFunctions(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	v1 := moduleWith(t, "balance")
+	h.fake.Deploy(idA, v1)
+	resp, raw := h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idA+`"}`)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
+
+	oldHash := stellartest.HashOf(v1)
+	h.fake.Upgrade(idA, moduleWith(t, "total"))
+	resp, raw = h.do(t, http.MethodPost, "/api/contracts/"+idA+"/refresh", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	t.Run("current interface", func(t *testing.T) {
+		resp, raw := h.do(t, http.MethodGet, "/api/contracts/"+idA+"/functions", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+		got := h.decode(t, raw)
+		assert.Equal(t, idA, got["contract_id"])
+		assert.Equal(t, "testnet", got["network"])
+		functions := got["functions"].([]any)
+		require.Len(t, functions, 1)
+		function := functions[0].(map[string]any)
+		assert.Equal(t, "total", function["name"])
+		assert.Equal(t, "fn total(who: Address) -> u32", function["signature"])
+		assert.Len(t, function, 2, "function listings contain names and signatures, not docs")
+	})
+
+	t.Run("previous version selected by wasm_hash", func(t *testing.T) {
+		resp, raw := h.do(t, http.MethodGet, "/api/contracts/"+idA+"/functions?wasm_hash="+oldHash, "")
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+		functions := h.decode(t, raw)["functions"].([]any)
+		require.Len(t, functions, 1)
+		assert.Equal(t, "balance", functions[0].(map[string]any)["name"])
+	})
+
+	t.Run("no functions returns an empty list", func(t *testing.T) {
+		module := wasmtest.Module(wasmtest.Section{Name: wasm.SectionContractSpec})
+		h.fake.Deploy(idB, module)
+		resp, raw := h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idB+`"}`)
+		require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
+
+		resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idB+"/functions", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+		assert.Equal(t, []any{}, h.decode(t, raw)["functions"])
 	})
 }
 

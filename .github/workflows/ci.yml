@@ -112,6 +112,24 @@ jobs:
       - name: Type-check the golden client
         run: npm run typecheck
 
+  # The Go tests prove the API works; this proves the Helm chart that
+  # deploys it is well-formed and renders.
+  helm:
+    runs-on: ubuntu-latest
+
+    # Read-only: the job checks the code out and lints the chart in it. It
+    # writes nothing back.
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+      - name: Lint chart
+        run: helm lint deploy/helm/sorovault --set database.existingSecret=sorovault-db
+      - name: Render chart
+        run: helm template sorovault deploy/helm/sorovault --set database.existingSecret=sorovault-db
+
   # The Go tests prove openapi.json matches the router; this proves it is a
   # valid OpenAPI document that client generators will accept.
   openapi-lint:

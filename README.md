@@ -117,6 +117,26 @@ $ curl -X POST localhost:8080/api/contracts \
 
 Open <http://localhost:8080> for the browse UI.
 
+### Kubernetes with Helm
+
+The chart at [`deploy/helm/sorovault`](deploy/helm/sorovault) deploys the API
+and runs database migrations before install and upgrade. It expects an
+existing PostgreSQL database; it does not install or manage PostgreSQL. Create
+a Secret containing the connection URL, then install the chart:
+
+```console
+$ kubectl create secret generic sorovault-db \\
+  --from-literal=DATABASE_URL='postgres://sorovault:password@postgres:5432/sorovault?sslmode=disable'
+$ helm upgrade --install sorovault ./deploy/helm/sorovault \\
+  --set database.existingSecret=sorovault-db
+```
+
+The secret name and key, image, service, and SoroVault environment settings can
+be overridden in a values file. `RPC_URL`, `NETWORK_PASSPHRASE`, `HTTP_ADDR`,
+`LOG_LEVEL`, `RPC_TIMEOUT`, and `REFRESH_INTERVAL` are exposed under `config`;
+use `extraEnv` for other environment variables. The server and migration Job
+run non-root with read-only root filesystems.
+
 ### Running locally
 
 ```console
@@ -136,6 +156,7 @@ All configuration is environment variables. Only `DATABASE_URL` (or the path in 
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | — | Postgres connection string. **Required** (or set `DATABASE_URL_FILE` to read it from a file). |
+| `MAX_CONCURRENT_REGISTRATIONS` | `4` | how many registrations and refreshes run at once |
 | `DATABASE_MAX_CONNS` | pgx's own (the greater of 4 or the CPU count) | most connections the pool holds open |
 | `DATABASE_MIN_CONNS` | `0` | connections the pool keeps open between requests |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint |
@@ -162,6 +183,34 @@ A contract that fails to refresh — expired, or an RPC error — is logged and
 skipped, and the sweep carries on. One sweep runs at startup and then one per
 interval; a sweep in progress at shutdown is cancelled before the database is
 closed.
+
+### Bounded registrations
+
+Registering a contract downloads its WASM module and decodes it in memory,
+so the number of registrations running at once is what keeps peak memory
+finite. `MAX_CONCURRENT_REGISTRATIONS` (default `4`) bounds it, across every
+client: the API, the CLI and the background refresher all draw on the same
+budget, because they all download modules.
+
+A request that cannot be given a slot waits a couple of seconds for one and
+is then refused with **503** and a `Retry-After` header, rather than queueing
+without limit:
+
+```console
+$ curl -si -X POST localhost:8080/api/contracts \
+    -H 'content-type: application/json' \
+    -d '{"contract_id":"CDZZ…4PAN"}'
+HTTP/1.1 503 Service Unavailable
+Retry-After: 2
+…
+{"error":"registry: too many registrations in flight: 4 already running"}
+```
+
+The wait is short on purpose: a client that is told to come back shortly is
+better served than one left hanging behind a queue the server cannot drain.
+The refresher treats a busy registry the same way — it skips the contract and
+picks it up on the next sweep, since a contract that was not refreshed stays
+stale.
 
 ### Connection pool
 

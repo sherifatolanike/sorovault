@@ -71,7 +71,7 @@ jobs:
       - name: Merge passing pull requests
         env:
           GH_TOKEN: ${{ github.token }}
-          REQUIRED_CHECKS: "test codegen-typecheck openapi-lint docker workflow-hygiene govulncheck"
+          REQUIRED_CHECKS: "test codegen-typecheck helm openapi-lint docker workflow-hygiene govulncheck"
           PROTECTED_PATHS: ".github/ .goreleaser.yaml Dockerfile internal/codegen/testdata/package.json internal/codegen/testdata/tsconfig.json"
           CI_WORKFLOW: "ci.yml"
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}

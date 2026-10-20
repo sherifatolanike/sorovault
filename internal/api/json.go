@@ -48,7 +48,7 @@ type contractResponse struct {
 	// Current is false when an older version was requested explicitly.
 	Current bool `json:"current"`
 
-	Interface *model.Interface `json:"interface"`
+	Interface json.RawMessage `json:"interface"`
 }
 
 type functionResponse struct {
@@ -61,6 +61,18 @@ type functionResponse struct {
 	Signature string `json:"signature"`
 
 	Function model.Function `json:"function"`
+}
+
+type functionListResponse struct {
+	ContractID string            `json:"contract_id"`
+	Network    string            `json:"network"`
+	WasmHash   string            `json:"wasm_hash"`
+	Functions  []functionSummary `json:"functions"`
+}
+
+type functionSummary struct {
+	Name      string `json:"name"`
+	Signature string `json:"signature"`
 }
 
 type versionsResponse struct {
