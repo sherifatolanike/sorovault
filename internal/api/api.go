@@ -379,6 +379,13 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, registry.ErrNetworkMismatch):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 
+	case errors.Is(err, registry.ErrBusy):
+		// The registry is already doing as much as it is allowed to. The
+		// request was fine, so the answer is "come back shortly", not an
+		// error: the client should not queue behind the others either.
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.reg.AcquireTimeout())))
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+
 	case isBadContractID(err), errors.Is(err, registry.ErrInvalidWasmHash):
 		writeError(w, http.StatusBadRequest, err.Error())
 

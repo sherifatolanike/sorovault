@@ -50,6 +50,10 @@ type Config struct {
 	NetworkPassphrase string
 	// DatabaseURL is the Postgres connection string for the registry.
 	DatabaseURL string
+	// MaxConcurrentRegistrations is how many registrations and refreshes
+	// may run at once, across every client. Zero means unset, and the
+	// registry's own default applies.
+	MaxConcurrentRegistrations int
 	// DatabaseMaxConns is the maximum number of connections the registry's
 	// pool holds open. Zero means unset, and pgx's own default applies.
 	DatabaseMaxConns int32
@@ -132,6 +136,13 @@ func Load() (*Config, error) {
 		cfg.RefreshInterval = d
 	}
 
+	limit, err := envInt("MAX_CONCURRENT_REGISTRATIONS",
+		MinConcurrentRegistrationLimit, MaxConcurrentRegistrationLimit)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConcurrentRegistrations = limit
+
 	maxConns, err := envPoolSize("DATABASE_MAX_CONNS", MinDatabaseMaxConns)
 	if err != nil {
 		return nil, err
@@ -203,6 +214,28 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envInt reads an integer from the environment.
+//
+// An unset or empty variable yields zero, which means "not configured". A
+// value that is not a whole number, or that falls outside the accepted
+// range, is an error: a limit of zero registrations would stop the registry
+// working, and one of thousands would not be a limit.
+func envInt(name string, min, max int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s %q: %w", name, raw, err)
+	}
+	if n < min || n > max {
+		return 0, fmt.Errorf("config: %s must be between %d and %d, got %d",
+			name, min, max, n)
+	}
+	return n, nil
 }
 
 // envPoolSize reads a connection pool size from the environment.
